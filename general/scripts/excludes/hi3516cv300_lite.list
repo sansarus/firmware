@@ -46,3 +46,5 @@
 /usr/lib/sensors/libsns_sc3235.so
 /usr/lib/sensors/libsns_sc4236.so
 /usr/lib/sensors/libsns_sp2305.so
+/usr/lib/sensors/libsns_imx307.so
+/usr/lib/sensors/libsns_imx335.so

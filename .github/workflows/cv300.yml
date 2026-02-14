@@ -1,4 +1,4 @@
-name: build
+name: cv300
 on:
   pull_request:
     branches:

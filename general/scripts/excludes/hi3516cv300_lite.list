@@ -35,6 +35,8 @@
 /lib/modules/4.9.37/kernel/drivers/usb/serial/usb-serial-simple.ko
 /lib/modules/4.9.37/kernel/drivers/usb/serial/usb_wwan.ko
 /lib/modules/4.9.37/kernel/drivers/usb/serial/usbserial.ko
+
+/lib/modules/3.18.20/kernel/storage/usb-storage.ko
 /usr/lib/sensors/libsns_f22.so
 /usr/lib/sensors/libsns_f23.so
 /usr/lib/sensors/libsns_f37.so
@@ -47,8 +49,16 @@
 /usr/lib/sensors/libsns_sc4236.so
 /usr/lib/sensors/libsns_sp2305.so
 /usr/lib/sensors/libsns_imx307.so
+/usr/lib/sensors/libsns_imx307_i2c_mipi.so
+/usr/lib/sensors/libsns_imx307_i2c_lvds.so
+/usr/lib/sensors/libsns_imx327_i2c_lvds.so
+/usr/lib/sensors/libsns_imx291_i2c_lvds.so
+/usr/lib/sensors/libsns_imx290_i2c_lvds.so
+/usr/lib/sensors/libsns_ar0237_i2c_dc.so
 /usr/lib/sensors/libsns_imx335.so
+/usr/lib/sensors/libsns_imx385.so
 /usr/lib/sensors/libsns_jxf22.so
+/usr/lib/sensors/libsns_jxf22_i2c_dc.so
 /usr/lib/sensors/libsns_jxf23.so
 /usr/lib/sensors/libsns_jxh62.so
 /usr/lib/sensors/libsns_jxh65.so
@@ -65,6 +75,9 @@
 /usr/lib/sensors/libsns_sc2035.so
 /usr/lib/sensors/libsns_sc2135.so
 /usr/lib/sensors/libsns_sc2235.so
+/usr/lib/sensors/libsns_sc2235p.so
+/usr/lib/sensors/libsns_sc2310.so
+
 #
 /lib/modules/4.9.37/kernel/drivers/staging/*/*.ko
 /lib/modules/4.9.37/kernel/drivers/staging/rtl8188eu/r8188eu.ko

@@ -37,6 +37,10 @@
 /lib/modules/4.9.37/kernel/drivers/usb/serial/usbserial.ko
 
 /lib/modules/3.18.20/kernel/storage/usb-storage.ko
+/lib/modules/3.18.20/kernel/drivers/usb/serial/option.ko
+/lib/modules/3.18.20/kernel/drivers/usb/serial/ftdi_sio.ko
+/lib/modules/3.18.20/kernel/drivers/usb/serial/pl2303.ko
+/lib/modules/3.18.20/kernel/drivers/usb/serial/cp210x.ko
 /usr/lib/sensors/libsns_f22.so
 /usr/lib/sensors/libsns_f23.so
 /usr/lib/sensors/libsns_f37.so

@@ -51,18 +51,19 @@ mkdir -p "$SB/tmp" "$SB/proc" "$SB/etc/init.d" "$SB/bin"
 # inline: $SB itself lives under /tmp, so a naive `s|/tmp|$SB/tmp|` would go on
 # to rewrite the very paths the earlier rules had just produced.
 #
-#  1. get_system_version() takes its root as "$1" — "" for the running system
+#  1. get_system_version() and get_system_platform() take their root as "$1" — "" for the running system
 #     (which must be sandboxed) and the mountpoint for the candidate rootfs
 #     (which must NOT be). Give it a default and hide the literal behind a
 #     sentinel so rule 3 cannot touch it. Getting this wrong makes every
 #     version read empty, which silently turns the same-version test green.
 #  2. /tmp\b, before anything that inserts a /tmp path of its own.
-sed -e 's|grep "GITHUB_VERSION" "$1/etc/os-release"|grep "GITHUB_VERSION" "${1:-@SB@}@OSRELEASE@"|' \
+sed -e 's|"$1/etc/os-release"|"${1:-@SB@}@OSRELEASE@"|g' \
     -e "s|/tmp\\b|@SB@/tmp|g" \
     -e "s|/etc/os-release|@SB@/etc/os-release|g" \
     -e "s|/proc/mtd|@SB@/proc/mtd|g" \
     -e "s|/proc/cmdline|@SB@/proc/cmdline|g" \
     -e "s|/proc/mounts|@SB@/proc/mounts|g" \
+    -e "s|/proc/meminfo|@SB@/proc/meminfo|g" \
     -e "s|/proc/sys/vm/drop_caches|@SB@/tmp/drop_caches|g" \
     -e "s|/etc/init.d/|@SB@/etc/init.d/|g" \
     -e "s|/bin/busybox|@SB@/bin/busybox|g" \
@@ -105,6 +106,17 @@ set_mounts() {
 }
 set_mounts
 
+# MemAvailable is the budget check_unpack_ram measures an unpack against. The
+# default is generous, so every test that is not about memory sees the same
+# camera it always did; the memory tests set it to the figure the reporter's
+# gk7205v200 had. Deliberately more than one line, because the awk that reads it
+# has to pick MemAvailable out and not MemFree above it.
+set_meminfo() {
+    printf 'MemTotal:       %8d kB\nMemFree:        %8d kB\nMemAvailable:   %8d kB\n' \
+        131072 "${1:-65536}" "${1:-65536}" > "$SB/proc/meminfo"
+}
+set_meminfo
+
 set_mtd() { cat > "$SB/proc/mtd"; }
 
 set_mtd <<'EOF'
@@ -131,16 +143,86 @@ set_cmdline "$CMDLINE_FLASH"
 stub() { printf '#!/bin/bash\n%s\n' "$2" > "$SB/bin/$1"; chmod +x "$SB/bin/$1"; }
 
 stub ipcinfo    'case "$1" in -v) echo "${STUB_VENDOR:-sigmastar}";; -F) echo nor;; esac'
-stub fw_printenv 'echo "${STUB_SOC:-ssc338q}"'
+# `upgrade` is the URL a builder profile writes on first boot; unset models
+# the env that lost it, or never had it (#2484).
+stub fw_printenv '
+if [ "$2" = upgrade ]; then
+    [ -n "${STUB_UPGRADE:-}" ] && { echo "$STUB_UPGRADE"; exit 0; }
+    exit 1
+fi
+echo "${STUB_SOC:-ssc338q}"'
 stub killall    'exit 0'
 stub ntpd       'exit 0'
-stub curl       'exit "${STUB_CURL_RC:-0}"'
-stub umount     'exit 0'
+# Three shapes reach this.
+#
+#  -r    gzip_isize_kb asking for the trailer. STUB_ISIZE set means a server
+#        that implements Range: four little-endian bytes into the -o target and
+#        a 206. Unset means one that does not -- GitHub's asset host answers
+#        501 -- so the caller must fall back.
+#  -sIL  remote_length_kb's HEAD. Always answered as a redirect that carries a
+#        body length of its own (legal, and what makes "the last length in the
+#        stream" the wrong reading) followed by the artifact. STUB_DL_BYTES
+#        unset makes that final response chunked, i.e. a server that will not
+#        say, which check_unpack_ram has to treat as "no opinion".
+#  else  a body fetch whose only interesting property is its exit status.
+stub curl '
+out=""; prev=""; ranged=0; head=0
+for a in "$@"; do
+    [ "$prev" = "-o" ] && out=$a
+    [ "$a" = "-r" ] && ranged=1
+    [ "$a" = "-sIL" ] && head=1
+    prev=$a
+done
+if [ "$ranged" = "1" ]; then
+    if [ -n "${STUB_RANGE_IGNORED:-}" ] && [ -n "$out" ]; then
+        # A server with no Range support: 200, and the whole file. The real
+        # request caps this with --max-filesize, so only the head of it lands --
+        # which begins with the gzip magic, 0x08088b1f.
+        printf %b "\\x1f\\x8b\\x08\\x08\\x00\\x00\\x00\\x00" > "$out"
+        printf 200
+        exit 0
+    fi
+    if [ -n "${STUB_ISIZE:-}" ] && [ -n "$out" ]; then
+        n=$STUB_ISIZE
+        printf %b "$(printf "\\x%02x\\x%02x\\x%02x\\x%02x" \
+            $((n & 255)) $(((n >> 8) & 255)) $(((n >> 16) & 255)) $(((n >> 24) & 255)))" > "$out"
+        printf 206
+    else
+        printf 501
+    fi
+    exit 0
+fi
+if [ "$head" = "1" ]; then
+    printf "HTTP/1.1 302 Found\r\ncontent-length: 65536\r\nlocation: /dl\r\n\r\n"
+    if [ -n "${STUB_DL_BYTES:-}" ]; then
+        printf "HTTP/1.1 200 OK\r\ncontent-length: %s\r\n\r\n" "$STUB_DL_BYTES"
+    else
+        printf "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n"
+    fi
+    exit 0
+fi
+[ "$out" = "-" ] && [ -n "${STUB_DL_FILE:-}" ] && cat "$STUB_DL_FILE"
+exit "${STUB_CURL_RC:-0}"'
+# check_sdcard re-reads `mount` after every umount, so a static pair of stubs
+# would spin forever: the unmount has to actually change what mount reports.
+# $SDMOUNTS is what a bare `mount` prints; empty is the default, which is what
+# every test that does not care about an SD card sees.
+SDMOUNTS="$SB/tmp/sdmounts"
+: > "$SDMOUNTS"
+cat > "$SB/bin/umount" <<EOF
+#!/bin/bash
+if [ -n "\$1" ]; then
+    grep -v " \$1 " "\$SDMOUNTS" > "\$SDMOUNTS.n" 2>/dev/null
+    mv "\$SDMOUNTS.n" "\$SDMOUNTS" 2>/dev/null
+fi
+exit 0
+EOF
+chmod +x "$SB/bin/umount"
 # Logs so ordering can be asserted, and fails by default: an unprivileged test
 # host cannot really pivot, and the fallback is the safety property that matters
 # most here (a camera that cannot build a ramfs must still upgrade).
 stub pivot_root 'echo "pivot_root $*" >> "$FLASH_LOG"; exit ${STUB_PIVOT_RC:-1}'
-stub losetup    'case "$1" in -f) echo /dev/loop0;; *) exit 0;; esac'
+stub losetup    'case "$1" in -f) echo /dev/loop0;; -d) echo "losetup -d $2" >> "$FLASH_LOG";; esac; exit 0'
 
 # download_firmware runs `md5sum -s -c`. -s (silent) is a busybox extension; GNU
 # coreutils spells it --status and rejects -s outright. Bridge it, so the real
@@ -163,11 +245,23 @@ chmod +x "$SB/bin/md5sum"
 #
 # STUB_FLASHCP_FAIL makes the write fail AFTER it has been logged -- a partially
 # erased partition, which is the state do_update_firmware's `|| die` reacts to.
+#
+# STUB_FLASHCP_FAIL_DEV fails only the write to one device, which is what a
+# split-layout run needs: the kernel goes down first, so failing everything
+# cannot tell "the rootfs write failed" from "we never got that far".
 stub busybox '
 applet=$1; shift
 case "$applet" in
     flashcp|flash_eraseall) echo "$applet $*" >> "$FLASH_LOG"
-                            [ "1" = "$STUB_FLASHCP_FAIL" ] && exit 1 ;;
+                            # Real flashcp writes progress to stdout, and under
+                            # -s that is what set_progress pipes through awk for
+                            # the WebUI. Without some, "does the progress still
+                            # come out?" would be asserted against an empty pipe.
+                            printf "Erasing block 1/1 (100%%)\nWriting kb 8/8 (100%%)\n"
+                            [ "1" = "$STUB_FLASHCP_FAIL" ] && exit 1
+                            if [ -n "$STUB_FLASHCP_FAIL_DEV" ]; then
+                                case " $* " in *" $STUB_FLASHCP_FAIL_DEV "*) exit 1 ;; esac
+                            fi ;;
     reboot)                 echo "reboot" >> "$FLASH_LOG"; exit 0 ;;
 esac
 exit 0'
@@ -178,7 +272,7 @@ exit 0'
 #   hang — mount blocks; only a bounded caller survives this
 # A bare `mount` (check_sdcard's `mount | grep /mnt/mmc`) must stay quiet.
 stub mount '
-[ $# -eq 0 ] && exit 0
+[ $# -eq 0 ] && { cat "$SDMOUNTS" 2>/dev/null; exit 0; }
 target=${!#}
 # STUB_MOUNT models the VERIFY-mount (a squashfs image over a loop device). The
 # ramfs pivot mounts tmpfs and relocates existing mounts; those are a different
@@ -197,6 +291,8 @@ case "${STUB_MOUNT:-ok}" in
     ok)
         mkdir -p "$target/etc"
         echo "GITHUB_VERSION=${STUB_IMG_VERSION:-2026.07.11}" > "$target/etc/os-release"
+        [ -n "${STUB_IMG_PLATFORM:-}" ] &&
+            echo "BUILD_PLATFORM=$STUB_IMG_PLATFORM" >> "$target/etc/os-release"
         echo "openipc-${STUB_IMG_SOC:-ssc338q}" > "$target/etc/hostname"
         exit 0 ;;
     fail)
@@ -209,12 +305,16 @@ case "${STUB_MOUNT:-ok}" in
         exec sleep "${STUB_HANG_SECS:-600}" ;;
 esac'
 
-cat > "$SB/etc/os-release" <<'EOF'
-BUILD_PLATFORM=ssc338q_lite
-BUILD_OPTION=lite
+# set_platform <BUILD_PLATFORM> [BUILD_OPTION]: the build the camera runs.
+set_platform() {
+    cat > "$SB/etc/os-release" <<EOF
+BUILD_PLATFORM=$1
+BUILD_OPTION=${2:-lite}
 GITHUB_VERSION=2026.06.01
 BUILD_ID=nightly-20260601-aaaaaaa
 EOF
+}
+set_platform ssc338q_lite
 
 # --- fixtures --------------------------------------------------------------
 # A legacy uImage: 32-byte header (magic 0x27051956, timestamp at offset 8),
@@ -236,6 +336,22 @@ make_fit() {
 }
 
 make_rootfs() { dd if=/dev/zero bs=1k count=8 of="$1" 2>/dev/null; }
+
+# A squashfs whose superblock claims $2 bytes, padded to $3 bytes on disk ($3
+# defaults to $2). $3 < $2 is what an unpack that runs out of room in /tmp
+# leaves behind, and what check_rootfs_complete has to refuse; $3 > $2 is what
+# repack normally produces, because it pads the artifact to a 4K boundary. Only
+# the two fields sysupgrade reads are real: the magic at 0, bytes_used at 0x28.
+make_squashfs() {
+    local claimed=$2 ondisk=${3:-$2}
+    printf '\x68\x73\x71\x73' > "$1"                      # 'hsqs'
+    dd if=/dev/zero bs=1 count=36 >> "$1" 2>/dev/null       # 4..39
+    printf %b "$(printf '\\x%02x\\x%02x\\x%02x\\x%02x' \
+        $((claimed & 255)) $(((claimed >> 8) & 255)) \
+        $(((claimed >> 16) & 255)) $(((claimed >> 24) & 255)))" >> "$1"
+    dd if=/dev/zero bs=1 count=4 >> "$1" 2>/dev/null        # 44..47, the high half
+    dd if=/dev/zero bs=1 count=$((ondisk - 48)) >> "$1" 2>/dev/null
+}
 
 # A combined image (cv6xx): the FIT and the rootfs squashfs in one blob, rootfs
 # packed after the FIT at a 64K-aligned offset. do_update_firmware splits it on
@@ -268,15 +384,25 @@ run() {
     : > "$SB/tmp/flash.log"
     OUT=$(cd "$SB" && env PATH="$SB/bin:$PATH" \
         HASERLVER=1 FLASH_LOG="$SB/tmp/flash.log" mount_wait="${MOUNT_WAIT:-3}" \
+        SDMOUNTS="$SDMOUNTS" \
         abort_wait=0 RAM_ROOT="$SB/ram" \
+        WDOG="${WDOG:-$SB/dev/watchdog}" WDOG_PROC="${WDOG_PROC:-$SB/proc}" \
         STUB_PIVOT_RC="${STUB_PIVOT_RC:-1}" \
         STUB_MOUNT="${STUB_MOUNT:-ok}" STUB_VENDOR="${STUB_VENDOR:-sigmastar}" \
         STUB_SOC="${STUB_SOC:-ssc338q}" \
         STUB_IMG_SOC="${STUB_IMG_SOC:-ssc338q}" \
         STUB_IMG_VERSION="${STUB_IMG_VERSION:-2026.07.11}" \
+        STUB_IMG_PLATFORM="${STUB_IMG_PLATFORM:-}" \
+        STUB_UPGRADE="${STUB_UPGRADE:-}" \
+        STUB_DL_FILE="${STUB_DL_FILE:-}" \
         STUB_FLASHCP_FAIL="${STUB_FLASHCP_FAIL:-0}" \
+        STUB_FLASHCP_FAIL_DEV="${STUB_FLASHCP_FAIL_DEV:-}" \
         STUB_REMOUNT_RC="${STUB_REMOUNT_RC:-0}" \
         STUB_CURL_RC="${STUB_CURL_RC:-0}" \
+        STUB_DL_BYTES="${STUB_DL_BYTES:-}" \
+        STUB_ISIZE="${STUB_ISIZE:-}" \
+        STUB_RANGE_IGNORED="${STUB_RANGE_IGNORED:-}" \
+        UNPACK_RESERVE_KB="${UNPACK_RESERVE_KB:-512}" \
         sh "$SB/sysupgrade" "$@" 2>&1)
     RC=$?
 }
@@ -296,7 +422,12 @@ at() { printf '%s\n' "$OUT" | grep -n -- "$1" | head -1 | cut -d: -f1; }
 
 reset_env() {
     unset STUB_MOUNT STUB_VENDOR STUB_SOC STUB_IMG_SOC STUB_IMG_VERSION MOUNT_WAIT
-    unset STUB_FLASHCP_FAIL STUB_PIVOT_RC STUB_REMOUNT_RC STUB_CURL_RC
+    unset STUB_UPGRADE STUB_IMG_PLATFORM STUB_DL_FILE
+    set_platform ssc338q_lite
+    unset STUB_FLASHCP_FAIL STUB_FLASHCP_FAIL_DEV STUB_PIVOT_RC STUB_REMOUNT_RC STUB_CURL_RC
+    unset STUB_DL_BYTES STUB_ISIZE STUB_RANGE_IGNORED UNPACK_RESERVE_KB
+    set_meminfo
+    : > "$SDMOUNTS"
     set_mounts
     rm -rf "$SB/ram"
     rm -f "$SB"/tmp/*.ssc338q "$SB"/tmp/firmware.bin.* "$SB"/tmp/*.tgz "$SB"/tmp/*.md5sum
@@ -478,6 +609,469 @@ if [ "$RC" -ne 0 ] && nothing_wrote; then
     ok "combined image, wrong SoC -> refused, FIT never written"
 else
     bad "combined + wrong SoC -> expected refusal with no write, rc=$RC log='$(cat "$SB/tmp/flash.log")'"
+fi
+
+# --- the staged archive is not kept ----------------------------------------
+# The WebUI's "install from a file" route uploads the .tgz into /tmp and then
+# points --archive at it, so from the unpack onwards /tmp holds the image twice
+# over -- on a 64 MB SigmaStar that is most of the tmpfs, and the flash phase
+# still wants room for the dd split and the verify mount
+# (OpenIPC/majestic-webui#474). $SB/tmp IS /tmp here: the harness rewrites the
+# literal in the script under test, so the guard fires exactly as it would on a
+# camera.
+reset_env
+make_combined "$SB/tmp/firmware.bin.ssc338q"
+make_archive "$SB/tmp/firmware.bin.ssc338q"
+run -z --archive="$SB/tmp/fw.tgz"
+if [ "$RC" -eq 0 ] && [ ! -f "$SB/tmp/fw.tgz" ]; then
+    ok "an archive staged in /tmp is freed once it has been unpacked"
+else
+    bad "staged archive should not survive the unpack, rc=$RC present=$([ -f "$SB/tmp/fw.tgz" ] && echo yes || echo no)"
+fi
+
+# ...but only that one. --archive can name a file on an SD card or a share, and
+# deleting the operator's own copy of an image is not this script's business.
+reset_env
+mkdir -p "$SB/keep"
+make_combined "$SB/tmp/firmware.bin.ssc338q"
+make_archive "$SB/tmp/firmware.bin.ssc338q"
+mv "$SB/tmp/fw.tgz" "$SB/keep/fw.tgz"
+run -z --archive="$SB/keep/fw.tgz"
+if [ "$RC" -eq 0 ] && [ -f "$SB/keep/fw.tgz" ]; then
+    ok "an archive the caller owns is left where they put it"
+else
+    bad "archive outside /tmp must be kept, rc=$RC present=$([ -f "$SB/keep/fw.tgz" ] && echo yes || echo no)"
+fi
+
+# ...and "under /tmp" is about where the file IS, not how it was spelt. A path
+# that walks back out lands on the caller's own media, which is the one thing
+# this guard exists not to delete.
+reset_env
+mkdir -p "$SB/keep"
+make_combined "$SB/tmp/firmware.bin.ssc338q"
+make_archive "$SB/tmp/firmware.bin.ssc338q"
+mv "$SB/tmp/fw.tgz" "$SB/keep/fw.tgz"
+run -z --archive="$SB/tmp/../keep/fw.tgz"
+if [ "$RC" -eq 0 ] && [ -f "$SB/keep/fw.tgz" ]; then
+    ok "an archive reached through /tmp/.. is still the caller's"
+else
+    bad "a /tmp/.. alias must not delete an outside archive, rc=$RC present=$([ -f "$SB/keep/fw.tgz" ] && echo yes || echo no)"
+fi
+
+# --- an image shorter than its own superblock -------------------------------
+#
+# Reported 2026-09-18: a gk7205v200 froze at "Erasing block: 62/64 (96%)" and
+# came back with a corrupted filesystem. 64 blocks is 4 MB of erase, and the
+# rootfs published for that camera is 4.70 MB -- it flashed an image ~500 KB
+# short. Every gate it passed on the way is load-bearing here: an unpack that
+# fills /tmp drops the image's .md5sum (packed after the image, so it is the
+# member that does not land), which narrows `md5sum -c *.md5sum` to the kernel
+# and still exits 0; the loop-mount then fails, which is deliberately NOT fatal
+# because a running kernel may lack the new decompressor; and flashcp verifies
+# the file against the flash rather than against a filesystem, so it reports
+# success. The squashfs's own recorded length is the one witness that survives
+# all three.
+reset_env
+make_squashfs "$R" 8192 4096
+run -z --kernel="$K" --rootfs="$R"
+if [ "$RC" -ne 0 ] && nothing_wrote && printf '%s' "$OUT" | grep -q "Incomplete rootfs"; then
+    ok "a rootfs shorter than its own superblock is refused before any write"
+else
+    bad "short rootfs -> expected a clean refusal, rc=$RC log='$(cat "$SB/tmp/flash.log")'"
+fi
+grep -q "S95majestic restart" "$SB/tmp/flash.log" \
+    && ok "...and the refusal hands the stopped services back" \
+    || bad "a short-rootfs refusal must restore the services it stopped"
+
+# Padding is normal, so the test is "shorter than", never "not equal to".
+reset_env
+make_squashfs "$R" 8192 12288
+run -z --kernel="$K" --rootfs="$R"
+{ [ "$RC" -eq 0 ] && flashed /dev/mtd3; } \
+    && ok "a squashfs padded past its recorded length still flashes" \
+    || bad "padded rootfs -> expected a flash, rc=$RC log='$(cat "$SB/tmp/flash.log")'"
+
+# And no magic means no opinion: the guard must not start rejecting artifacts it
+# cannot actually measure.
+reset_env
+run -z --kernel="$K" --rootfs="$R"
+{ [ "$RC" -eq 0 ] && flashed /dev/mtd3; } \
+    && ok "a rootfs with no squashfs magic is left alone" \
+    || bad "an unmeasurable rootfs must keep today's behaviour, rc=$RC"
+
+# --- a checksum that never arrived is not a checksum that passed ------------
+#
+# `md5sum -c *.md5sum` verifies what the manifests list and says nothing about a
+# file no manifest names, so the gate does not fail when a companion goes
+# missing -- it silently narrows. This is the archive that proves it.
+reset_env
+rm -rf "$SB/stage2"; mkdir -p "$SB/stage2"
+cp "$K" "$SB/stage2/uImage.ssc338q"
+cp "$R" "$SB/stage2/rootfs.squashfs.ssc338q"
+(cd "$SB/stage2" && md5sum uImage.ssc338q > openipc.md5sum)
+(cd "$SB/stage2" && tar cf - . | gzip > "$SB/tmp/fw.tgz")
+run -z --archive="$SB/tmp/fw.tgz"
+if [ "$RC" -ne 0 ] && nothing_wrote && printf '%s' "$OUT" | grep -q "Nothing checksums rootfs.squashfs.ssc338q"; then
+    ok "an image no manifest covers is refused, not waved through"
+else
+    bad "uncovered rootfs -> expected a refusal, rc=$RC log='$(cat "$SB/tmp/flash.log")'"
+fi
+
+# A manifest may legitimately name its members with a leading "./" -- that is
+# what `md5sum` writes when it is run from a staging directory, and `md5sum -c`
+# verifies it fine from /tmp. Refusing those would block a good archive from
+# installing, which is worse than the hole the coverage check closes.
+reset_env
+rm -rf "$SB/stage3"; mkdir -p "$SB/stage3"
+cp "$K" "$SB/stage3/uImage.ssc338q"
+cp "$R" "$SB/stage3/rootfs.squashfs.ssc338q"
+(cd "$SB/stage3" && md5sum ./uImage.ssc338q ./rootfs.squashfs.ssc338q > openipc.md5sum)
+(cd "$SB/stage3" && tar cf - . | gzip > "$SB/tmp/fw.tgz")
+run -z --archive="$SB/tmp/fw.tgz"
+{ [ "$RC" -eq 0 ] && flashed /dev/mtd3; } \
+    && ok "a manifest that names its members ./x still counts as coverage" \
+    || bad "./-prefixed manifest names must not be refused, rc=$RC log='$(cat "$SB/tmp/flash.log")'"
+
+# --- an unpack with nowhere to go ------------------------------------------
+#
+# The archive routes hold the .tgz and everything inside it on the same tmpfs at
+# once: 6395 KB + 6413 KB against a 13564 KB /tmp on the camera this was
+# reported from. Past that edge tar dies mid-member and leaves the truncated
+# image the cases above have to catch, so refuse while the numbers are still
+# knowable. #2425 frees the archive after the unpack, which cannot help the
+# unpack itself.
+reset_env
+make_archive "$K" "$R"
+stub df 'echo "Filesystem 1K-blocks Used Available Use% Mounted on"; echo "tmpfs 13564 13560 4 99% /tmp"'
+run -z --archive="$SB/tmp/fw.tgz"
+if [ "$RC" -ne 0 ] && nothing_wrote && printf '%s' "$OUT" | grep -q "No room to unpack"; then
+    ok "an unpack that cannot fit is refused before it truncates an image"
+else
+    bad "full /tmp -> expected a refusal, rc=$RC log='$(cat "$SB/tmp/flash.log")'"
+fi
+rm -f "$SB/bin/df"
+
+# Fails open, like every other measurement in this script: a df that will not
+# answer is not grounds to refuse an upgrade.
+reset_env
+make_archive "$K" "$R"
+stub df 'exit 1'
+run -z --archive="$SB/tmp/fw.tgz"
+[ "$RC" -eq 0 ] \
+    && ok "...and a df that will not answer is not a refusal" \
+    || bad "an unreadable df must not block an upgrade, rc=$RC"
+rm -f "$SB/bin/df"
+
+# --- an unpack with nowhere to go, the other kind (issue #2457) -------------
+#
+# /tmp is a tmpfs, so the room question has a second half: the RAM the tmpfs is
+# made of. On a `mem=32M` camera that is the half that binds, and df cannot see
+# it -- the camera in #2457 was 400 KB short of the memory it needed while
+# reporting 51836 KB free in /tmp.
+#
+# It has to be refused BEFORE the unpack, because afterwards there is nobody
+# left to refuse it: tmpfs pages belong to no process, so the OOM killer takes
+# the largest RSS on the box instead, which is majestic -- and on a --web run
+# majestic is what is streaming the log. The observed failure is a transcript
+# that stops mid-sentence, a camera still on the old image, and RTSP and the
+# WebUI gone until it is power-cycled.
+reset_env
+set_meminfo 8192          # what free -h reported on the reporter's gk7205v200
+STUB_DL_BYTES=8691055     # openipc.gk7205v200-nor-ultimate.tgz
+run -z --web -k -r
+if [ "$RC" -ne 0 ] && nothing_wrote && printf '%s' "$OUT" | grep -q "Not enough memory to unpack"; then
+    ok "a streamed image larger than free RAM is refused before it is unpacked"
+else
+    bad "8487 KB into 8192 KB -> expected a refusal, rc=$RC out='$OUT'"
+fi
+
+# The advice has to be reachable. A WebUI run is the only one with majestic
+# still resident, so it is the only one told to go and use a shell; saying that
+# to somebody already in one would be noise.
+printf '%s' "$OUT" | grep -q "from ssh or the serial console" \
+    && ok "...and says where the missing memory is" \
+    || bad "a --web refusal should point at the shell path, out='$OUT'"
+
+reset_env
+set_meminfo 8192
+STUB_DL_BYTES=8691055
+run -z -k -r
+if [ "$RC" -ne 0 ] && printf '%s' "$OUT" | grep -q "Not enough memory to unpack" &&
+    ! printf '%s' "$OUT" | grep -q "from ssh or the serial console"; then
+    ok "...but a console run is not told to go and find a console"
+else
+    bad "a non-web refusal should not carry the --web advice, rc=$RC out='$OUT'"
+fi
+
+# --- #2484: a builder device profile must not be traded for the generic image
+#
+# A builder per-device build stamps BUILD_PLATFORM=<soc>_<variant>_<device> and
+# is published as ${BUILD_PLATFORM}-nor.tgz; its profile writes that URL into
+# the `upgrade` env var once, on first boot. With the var gone, a plain -k/-r
+# used to key on BUILD_OPTION alone and fetch OpenIPC/firmware's
+# openipc.<soc>-nor-lite.tgz -- same SoC stamp, fits the partitions, passes
+# every check, and boots without the profile's WiFi driver or mtdparts.
+# The memory refusal stops each run right after the URL is chosen, before
+# anything is unpacked.
+default_url_is() {
+    local want=$1; shift
+    reset_env
+    set_meminfo 8192
+    STUB_DL_BYTES=8691055
+    "$@"
+    run -z -k -r
+    if printf '%s' "$OUT" | grep -qF "Download from $want" && nothing_wrote; then
+        ok "default URL -> $want"
+    else
+        bad "expected 'Download from $want', rc=$RC out='$OUT'"
+    fi
+}
+B=https://github.com/OpenIPC/builder/releases/download/latest
+F=https://github.com/OpenIPC/firmware/releases/download/latest
+default_url_is "$B/ssc338q_lite_acme-cam1-nor.tgz" set_platform ssc338q_lite_acme-cam1
+default_url_is "$F/openipc.ssc338q-nor-lite.tgz"   set_platform ssc338q_lite
+default_url_is "$F/openipc.ssc338q-nor-ultimate.tgz" set_platform ssc338q_ultimate ultimate
+default_url_is "$B/openipc.ssc338q-nor-fpv.tgz"    set_platform ssc338q_fpv fpv
+default_url_is "https://mirror.example/x.tgz" eval 'set_platform ssc338q_lite_acme-cam1; STUB_UPGRADE=https://mirror.example/x.tgz'
+
+# Whatever the URL, the rootfs itself says what it was built as. A camera on a
+# device profile takes only an image for the same device.
+reset_env
+set_platform ssc338q_lite_acme-cam1
+STUB_IMG_PLATFORM=ssc338q_lite
+run -z --rootfs="$R"
+if [ "$RC" -ne 0 ] && nothing_wrote && printf '%s' "$OUT" | grep -q "Wrong platform"; then
+    ok "device profile + generic rootfs -> refused, nothing written"
+else
+    bad "device profile + generic rootfs -> expected refusal, rc=$RC out='$OUT'"
+fi
+printf '%s' "$OUT" | grep -q -- "--force_soc" \
+    && ok "...and names the option that overrides it" \
+    || bad "platform refusal should advise --force_soc, out='$OUT'"
+# Without the ramfs die() does not reboot, so a refusal that left the candidate
+# mounted would hand the next attempt a taken loop device.
+grep -q "losetup -d" "$SB/tmp/flash.log" \
+    && ok "...after releasing the candidate's loop device" \
+    || bad "platform refusal left the loop device attached, log='$(cat "$SB/tmp/flash.log")'"
+
+# An image from before BUILD_PLATFORM was stamped (1.0.51) has nothing to
+# compare, and passes as it always did.
+reset_env
+set_platform ssc338q_lite_acme-cam1
+run -z --rootfs="$R"
+if [ "$RC" -eq 0 ] && flashed /dev/mtd3 && printf '%s' "$OUT" | grep -q "no BUILD_PLATFORM"; then
+    ok "device profile + unstamped rootfs -> flashed, and says it could not compare"
+else
+    bad "device profile + unstamped rootfs -> expected to proceed with a note, rc=$RC out='$OUT'"
+fi
+
+# Unmountable (the running kernel lacks the new image's decompressor): the
+# artifact name is the only evidence left. It pins the SoC, which is enough on
+# a stock camera; on a device profile only a name carrying the device is.
+reset_env
+set_platform ssc338q_lite_acme-cam1
+make_fit "$SB/tmp/uImage.ssc338q"
+make_archive "$SB/tmp/uImage.ssc338q" "$SB/tmp/rootfs.squashfs.ssc338q"
+STUB_MOUNT=fail
+run -z --archive="$SB/tmp/fw.tgz"
+if [ "$RC" -ne 0 ] && nothing_wrote && printf '%s' "$OUT" | grep -q "device profile"; then
+    ok "device profile + unmountable archive -> refused, nothing written"
+else
+    bad "device profile + unmountable archive -> expected refusal, rc=$RC out='$OUT'"
+fi
+
+reset_env
+set_platform ssc338q_lite_acme-cam1
+make_fit "$SB/tmp/uImage.ssc338q"
+make_archive "$SB/tmp/uImage.ssc338q" "$SB/tmp/rootfs.squashfs.ssc338q"
+mkdir -p "$SB/keep" && mv "$SB/tmp/fw.tgz" "$SB/keep/dl.tgz"
+rm -f "$SB"/tmp/*.ssc338q
+STUB_DL_FILE="$SB/keep/dl.tgz"
+STUB_MOUNT=fail
+run -z -k -r
+if [ "$RC" -eq 0 ] && flashed /dev/mtd2 && flashed /dev/mtd3; then
+    ok "device profile + unmountable image fetched under the device's name -> proceeds"
+else
+    bad "the device's own artifact should not be refused, rc=$RC out='$OUT'"
+fi
+
+reset_env
+set_platform ssc338q_lite_acme-cam1
+make_fit "$SB/tmp/uImage.ssc338q"
+make_archive "$SB/tmp/uImage.ssc338q" "$SB/tmp/rootfs.squashfs.ssc338q"
+mv "$SB/tmp/fw.tgz" "$SB/keep/dl.tgz"
+rm -f "$SB"/tmp/*.ssc338q
+STUB_DL_FILE="$SB/keep/dl.tgz"
+STUB_UPGRADE=https://github.com/OpenIPC/firmware/releases/download/latest/openipc.ssc338q-nor-lite.tgz
+STUB_MOUNT=fail
+run -z -k -r
+if [ "$RC" -ne 0 ] && nothing_wrote; then
+    ok "device profile + unmountable image from a generic URL -> refused"
+else
+    bad "a generic URL is no proof of the device, rc=$RC out='$OUT'"
+fi
+rm -rf "$SB/keep"
+
+reset_env
+set_platform ssc338q_lite_acme-cam1
+STUB_IMG_PLATFORM=ssc338q_lite
+run -z --force_soc --rootfs="$R"
+[ "$RC" -eq 0 ] && flashed /dev/mtd3 \
+    && ok "device profile + generic rootfs + --force_soc -> flashed" \
+    || bad "--force_soc should override the platform check, rc=$RC out='$OUT'"
+
+# The same device's own image is what a profile camera upgrades to.
+reset_env
+set_platform ssc338q_lite_acme-cam1
+STUB_IMG_PLATFORM=ssc338q_lite_acme-cam1
+run -z --rootfs="$R"
+[ "$RC" -eq 0 ] && flashed /dev/mtd3 \
+    && ok "device profile + same device's rootfs -> flashed" \
+    || bad "same device should pass, rc=$RC out='$OUT'"
+
+# Moving onto a profile, and between stock variants, loses nothing that makes
+# the camera reachable, so neither is the platform check's business.
+reset_env
+STUB_IMG_PLATFORM=ssc338q_lite_acme-cam1
+run -z --rootfs="$R"
+[ "$RC" -eq 0 ] && flashed /dev/mtd3 \
+    && ok "generic build + device rootfs -> flashed (onboarding)" \
+    || bad "generic -> device should pass, rc=$RC out='$OUT'"
+
+reset_env
+STUB_IMG_PLATFORM=ssc338q_ultimate
+run -z --rootfs="$R"
+[ "$RC" -eq 0 ] && flashed /dev/mtd3 \
+    && ok "lite build + ultimate rootfs -> flashed" \
+    || bad "lite -> ultimate should pass, rc=$RC out='$OUT'"
+
+# The same measurement, on the archive route -- the WebUI's "install from a
+# file", which hands majestic's upload straight to --archive and so has majestic
+# resident too. Here df has an opinion and it is the wrong one: the sandbox's
+# /tmp is a real filesystem with gigabytes free, exactly as the camera's tmpfs
+# claimed 51836 KB while the machine had 9 MB to give.
+#
+# A zero-filled rootfs, because what check_unpack_room reads is the gzip
+# trailer: 12 MB of zeros costs the suite a few KB on disk and still asks the
+# question at the scale a real image asks it.
+reset_env
+dd if=/dev/zero bs=1k count=12288 of="$R" 2>/dev/null
+make_archive "$K" "$R"
+set_meminfo 8192
+run -z --archive="$SB/tmp/fw.tgz"
+if [ "$RC" -ne 0 ] && nothing_wrote && printf '%s' "$OUT" | grep -q "Not enough memory to unpack"; then
+    ok "a staged archive too big for RAM is refused even where df says there is room"
+else
+    bad "archive route ignored the memory budget, rc=$RC out='$OUT'"
+fi
+
+# Fails open on both halves of the arithmetic, like every other measurement in
+# this script. A server that will not give a size, and a /proc/meminfo that will
+# not parse, are each "no opinion" -- never a refusal.
+reset_env
+set_meminfo 8192
+run -z --web -k -r       # STUB_DL_BYTES unset: no Content-Length comes back
+if ! printf '%s' "$OUT" | grep -q "Not enough memory to unpack"; then
+    ok "a server that will not give a size is not a refusal"
+else
+    bad "an unknown download size must not block an upgrade, out='$OUT'"
+fi
+
+reset_env
+: > "$SB/proc/meminfo"
+STUB_DL_BYTES=8691055
+run -z --web -k -r
+if ! printf '%s' "$OUT" | grep -q "Not enough memory to unpack"; then
+    ok "...and neither is a /proc/meminfo that will not parse"
+else
+    bad "an unreadable meminfo must not block an upgrade, out='$OUT'"
+fi
+set_meminfo
+
+# The budget is not just the image. curl, gzip and tar are forked after
+# MemAvailable is read and live alongside the pages they write -- 96 pages
+# between them in the #2457 OOM dump -- so an unpack that fits with nothing to
+# spare does not fit. 8691055 B is 8487 KB, and the reserve is 512.
+reset_env
+set_meminfo 9000
+STUB_DL_BYTES=8691055
+run -z --web -k -r
+if ! printf '%s' "$OUT" | grep -q "Not enough memory to unpack"; then
+    ok "an image that fits with the reserve to spare is not refused"
+else
+    bad "8487+512 KB into 9000 KB should pass, out='$OUT'"
+fi
+
+reset_env
+set_meminfo 8999
+STUB_DL_BYTES=8691055
+run -z --web -k -r
+if [ "$RC" -ne 0 ] && nothing_wrote && printf '%s' "$OUT" | grep -q "Not enough memory to unpack"; then
+    ok "...and one kilobyte tighter is refused, with the reserve counted in"
+else
+    bad "8487+512 KB into 8999 KB should refuse, rc=$RC out='$OUT'"
+fi
+
+# Content-Length is a floor, not a bound. It is the unpacked size to within a
+# fraction of a percent for OpenIPC's own tarballs -- already-compressed
+# payloads -- but --url takes any archive, and a compressible one expands far
+# past it. Ask the gzip trailer first, wherever the server will serve a Range.
+reset_env
+set_meminfo 8192
+STUB_DL_BYTES=1048576     # 1 MB on the wire...
+STUB_ISIZE=52428800       # ...50 MB once unpacked
+run -z --web -k -r
+if [ "$RC" -ne 0 ] && printf '%s' "$OUT" | grep -q "51200 KB of image"; then
+    ok "the gzip trailer outranks Content-Length when the server serves a Range"
+else
+    bad "a compressible custom archive must be sized by its trailer, rc=$RC out='$OUT'"
+fi
+
+# And the trailer is only believed when it really is the trailer. A server that
+# ignores Range answers 200 with the whole file, where the first four bytes are
+# the gzip magic -- 0x08088b1f, which would read as a 135 MB unpack.
+reset_env
+set_meminfo 8192
+STUB_DL_BYTES=1048576
+run -z --web -k -r          # STUB_ISIZE unset: the stub answers 501
+if ! printf '%s' "$OUT" | grep -q "Not enough memory to unpack"; then
+    ok "...and a server with no Range support falls back instead of guessing"
+else
+    bad "a 501 to the range probe must fall back to Content-Length, out='$OUT'"
+fi
+
+# The other way a Range probe goes wrong: a 200 with the file itself, whose
+# first four bytes are the gzip magic 0x08088b1f -- 135 MB, if believed.
+reset_env
+set_meminfo 8192
+STUB_DL_BYTES=1048576
+STUB_RANGE_IGNORED=1
+run -z --web -k -r
+if ! printf '%s' "$OUT" | grep -q "Not enough memory to unpack"; then
+    ok "...and a 200 to a ranged request is not read as a trailer"
+else
+    bad "the gzip magic must not be mistaken for a length, out='$OUT'"
+fi
+
+# That probe writes into the tmpfs this guard protects, so it has to be capped
+# at the four bytes it wants. Without --max-filesize a ranged GET that the
+# server answers with the whole artifact downloads the whole artifact: measured
+# on a lab gk7205v300, a 200 MB one filled its 60 MB /tmp and reset the board.
+grep -q -- '--max-filesize' "$SRC" \
+    && ok "the range probe cannot download more than the four bytes it wants" \
+    || bad "gzip_isize_kb must cap its response size"
+
+# Which response the length came from matters. `curl -IL` prints every hop, so
+# the last length in the stream is the redirect's whenever the artifact itself
+# is chunked -- and the redirect below declares one, as a redirect with a body
+# may. Reading that would size a 8.5 MB image at 64 KB, or refuse on it.
+reset_env
+set_meminfo 64              # so any estimate at all would refuse
+run -z --web -k -r          # STUB_DL_BYTES unset: the final response is chunked
+if ! printf '%s' "$OUT" | grep -q "Not enough memory to unpack"; then
+    ok "a chunked artifact behind a redirect is not measured as the redirect"
+else
+    bad "Content-Length must come from the final response only, out='$OUT'"
 fi
 
 # --- transcript ------------------------------------------------------------
@@ -893,6 +1487,75 @@ else
 fi
 rm -f "$SB/bin/rmdir"
 
+# --- the pivot is entered only when it is needed (issue #2416) --------------
+#
+# There is no way back out of the ramfs. The shell, /etc, dropbear and getty are
+# all behind /mnt, so a run that pivots and then hands the camera back leaves a
+# box that answers ping and nothing else: the console loops on `can't run
+# '/sbin/getty'` and ssh rejects a key that worked a minute earlier, until
+# somebody power-cycles it.
+#
+# A kernel-only write never touches the mounted partition, so it never needed
+# the pivot the live rootfs write does -- and it is precisely the run where -x
+# is honoured, which is how people were stranded.
+reset_env
+run -z --kernel="$K" -x
+if [ "$RC" -eq 0 ] && ! grep -q "pivot_root" "$SB/tmp/flash.log" \
+    && flashed /dev/mtd2 && ! rebooted; then
+    ok "-x + kernel only -> no pivot, so the camera keeps its shell (#2416)"
+else
+    bad "a kernel-only run must not pivot, rc=$RC log='$(cat "$SB/tmp/flash.log")'"
+fi
+printf '%s' "$OUT" | grep -q "Flashing in place" \
+    && ok "...and says why there is no ramfs this time" \
+    || bad "a run that skips the pivot should say so; got: $(printf '%s' "$OUT" | tail -3)"
+
+# The other half: a write that DOES land on the live rootfs still moves into RAM.
+reset_env
+run -z --rootfs="$R"
+grep -q "pivot_root" "$SB/tmp/flash.log" \
+    && ok "a live-rootfs write still moves the flash phase into RAM" \
+    || bad "the rootfs write must still pivot, log='$(cat "$SB/tmp/flash.log")'"
+
+# Not every camera runs from the flash it writes; then the partition is just a
+# target and the pivot buys nothing.
+reset_env
+set_cmdline "$CMDLINE_NFS"
+run -z --rootfs="$R"
+if ! grep -q "pivot_root" "$SB/tmp/flash.log" && flashed /dev/mtd3 && [ "$RC" -eq 0 ]; then
+    ok "an NFS-rooted camera writes the rootfs partition without a pivot"
+else
+    bad "NFS root needs no pivot, rc=$RC log='$(cat "$SB/tmp/flash.log")'"
+fi
+
+# -n erases the jffs2 that is the overlay's UPPER layer, which overlayfs
+# consults on every lookup. That is as live as the squashfs, so it pivots.
+reset_env
+run -z -n
+grep -q "pivot_root" "$SB/tmp/flash.log" \
+    && ok "--wipe_overlay pivots too (the overlay it erases is live)" \
+    || bad "-n must pivot; the jffs2 it erases backs the running root"
+
+# The trap in "a kernel write is not a live write": a board with no separate
+# kernel partition has kernel_device pointing at the combined "firmware" one
+# (get_system_info's fallback), which overlaps the rootfs the camera runs from.
+# There a plain --kernel is a live-flash write -- it must pivot, and -x must not
+# be honoured after it -- and the run that looks most harmless is the one that
+# would have rewritten the running filesystem in place.
+reset_env
+set_mtd <<'EOF'
+dev:    size   erasesize  name
+mtd0: 00040000 00010000 "boot"
+mtd1: 00010000 00010000 "env"
+mtd2: 00700000 00010000 "firmware"
+EOF
+run -z --kernel="$K" -x
+if grep -q "pivot_root" "$SB/tmp/flash.log" && flashed /dev/mtd2 && rebooted; then
+    ok "kernel-only on a combined layout is a live write: pivots, and -x is overridden"
+else
+    bad "kernel into the firmware partition must pivot and reboot, rc=$RC log='$(cat "$SB/tmp/flash.log")'"
+fi
+
 # --- certificate verification (GHSA-fjf7-9x3v-6mj6) ------------------------
 # Every online fetch used to pass -k, so the network could hand the camera any
 # image -- and, through self_update, any script to exec as root. The probe
@@ -955,15 +1618,232 @@ fi
     || ok "...and the leftover is gone"
 rm -f "$SB/tmp/sysupgrade"
 
+# --- aborting on a recovery file left on the SD card ------------------------
+# check_sdcard runs AFTER create_lock and free_resources, so how it leaves is
+# not a detail: a bare `exit` there stranded the lock in /tmp (every later run
+# then refused with "Another sysupgrade process is already running!" until a
+# reboot), left syslogd/klogd/ntpd/crond stopped, and left majestic gutted by
+# free_resources' SIGQUIT -- a camera with no video and no logging, having been
+# told only to take the card out.
+#
+# The mount line only has to CONTAIN /mnt/mmc for check_sdcard's grep; the
+# directory it hands on is field 3, so it can point inside the sandbox and the
+# recovery file can actually exist.
+reset_env
+SD="$SB/mnt/mmcblk0p1"
+mkdir -p "$SD"
+: > "$SD/autoupdate-rootfs.img"
+printf '/dev/mmcblk0p1 on %s type vfat (rw,relatime)\n' "$SD" > "$SDMOUNTS"
+run -z --kernel="$K" --rootfs="$R"
+if [ "$RC" -ne 0 ] && nothing_wrote; then
+    ok "a recovery file on the card aborts before anything is written"
+else
+    bad "recovery file -> expected a clean abort, rc=$RC log='$(cat "$SB/tmp/flash.log")'"
+fi
+if [ ! -f "$SB/tmp/sysupgrade.lock" ]; then
+    ok "...and the abort takes its lock file with it"
+else
+    bad "the SD-card abort left the lock file behind; the next run is locked out"
+fi
+if grep -q "S95majestic restart" "$SB/tmp/flash.log"; then
+    ok "...and restarts the services free_resources stopped"
+else
+    bad "the SD-card abort skipped restore_resources; services stay stopped, majestic stays gutted"
+fi
+rm -f "$SD/autoupdate-rootfs.img"
+
+# The other half: a card with nothing incriminating on it is unmounted and the
+# run carries on. This is also what proves the loop terminates -- check_sdcard
+# re-reads `mount` after each umount, so a card that never goes away spins.
+reset_env
+printf '/dev/mmcblk0p1 on %s type vfat (rw,relatime)\n' "$SD" > "$SDMOUNTS"
+run -z --kernel="$K" --rootfs="$R"
+if [ "$RC" -eq 0 ] && flashed /dev/mtd2 && flashed /dev/mtd3; then
+    ok "a clean card is unmounted and the upgrade proceeds"
+else
+    bad "clean card -> expected the run to proceed, rc=$RC log='$(cat "$SB/tmp/flash.log")'"
+fi
+
+# ---------------------------------------------------------------------------
+echo
+echo "=== Part 1f: a refused write is not a completed one (issue #2426) ==="
+
+# Reported 2026-09-16: an image larger than the partition it is bound for makes
+# flashcp refuse -- it checks the size before it erases anything -- and
+# sysupgrade reported the upgrade as done. On the split path nothing ever looked
+# at flashcp's status, and the success lines are worse than a bare "OK": the
+# kernel one reads the version back off the DEVICE, so it prints the timestamp
+# of the kernel still sitting there, and the rootfs one prints the version
+# verify_rootfs read out of the CANDIDATE FILE -- exactly the version the
+# operator was hoping to see.
+
+# A kernel write that fails must be fatal, and must not claim a version.
+reset_env
+STUB_FLASHCP_FAIL_DEV=/dev/mtd2
+run -z --kernel="$K" --rootfs="$R"
+if [ "$RC" -ne 0 ] && ! printf '%s' "$OUT" | grep -q "Kernel updated to"; then
+    ok "a failed kernel write fails the run instead of announcing a version"
+else
+    bad "failed kernel write -> expected a non-zero exit and no success line, rc=$RC out='$(printf '%s' "$OUT" | tail -3)'"
+fi
+# ...and it must not go on to write the rootfs on top of it.
+! flashed /dev/mtd3 \
+    && ok "...and stops there rather than carrying on to the rootfs" \
+    || bad "the run continued to the rootfs after the kernel write failed"
+
+# The same for the rootfs, with the kernel write left working so the failure is
+# unambiguously the rootfs one.
+reset_env
+STUB_FLASHCP_FAIL_DEV=/dev/mtd3
+run -z --kernel="$K" --rootfs="$R"
+if [ "$RC" -ne 0 ] && ! printf '%s' "$OUT" | grep -q "RootFS updated to"; then
+    ok "a failed rootfs write fails the run instead of announcing a version"
+else
+    bad "failed rootfs write -> expected a non-zero exit and no success line, rc=$RC out='$(printf '%s' "$OUT" | tail -3)'"
+fi
+# It erased before it failed, so it has to reboot -- the #2231 rule, reached
+# from the split path for the first time.
+rebooted \
+    && ok "...and reboots, because a half-erased live partition is not survivable" \
+    || bad "a failed live-rootfs write must still reboot, log='$(cat "$SB/tmp/flash.log")'"
+
+# -s is the mode the WebUI drives, and it is the one where the guard was dead
+# code: set_progress pipes busybox through awk, and a pipeline reports its LAST
+# command's status, so every `|| die` behind it saw awk's 0.
+reset_env
+STUB_FLASHCP_FAIL_DEV=/dev/mtd3
+run -z -s --rootfs="$R"
+if [ "$RC" -ne 0 ]; then
+    ok "the write's status survives the progress pipe in silent mode"
+else
+    bad "-s masked a failed write behind awk's exit status, rc=$RC log='$(cat "$SB/tmp/flash.log")'"
+fi
+# And the mode still does what it is for: the write's own output, numbered.
+printf '%s' "$OUT" | grep -q '^1 Erasing' \
+    && ok "...and still prints the numbered progress the WebUI polls" \
+    || bad "-s no longer emits progress lines, out='$(printf '%s' "$OUT" | tail -3)'"
+
+# The reported case, end to end: an image too big for its partition. flashcp
+# would refuse it without erasing anything, so the right answer is to refuse it
+# BEFORE the pivot -- once inside the ramfs a die() has to reboot, and a reboot
+# with nothing written is indistinguishable from a successful upgrade to
+# anything watching the camera come back.
+reset_env
+set_mtd <<'EOF'
+dev:    size   erasesize  name
+mtd0: 00040000 00010000 "boot"
+mtd1: 00010000 00010000 "env"
+mtd2: 00200000 00010000 "kernel"
+mtd3: 00001000 00010000 "rootfs"
+mtd4: 00100000 00010000 "rootfs_data"
+EOF
+run -z --kernel="$K" --rootfs="$R"
+if [ "$RC" -ne 0 ] && nothing_wrote && ! rebooted; then
+    ok "a rootfs too big for its partition is refused with nothing written"
+else
+    bad "oversized rootfs -> expected a clean refusal, rc=$RC log='$(cat "$SB/tmp/flash.log")'"
+fi
+# The message has to name the two numbers; "flashcp failed" sends the operator
+# looking at the image when the answer is in their partition layout (#2238).
+if printf '%s' "$OUT" | grep -q "does not fit its partition"; then
+    ok "...and says which image, which partition, and by how much"
+else
+    bad "the refusal must name the sizes; got: $(printf '%s' "$OUT" | tail -3)"
+fi
+# Nothing was written, so the camera is untouched: it keeps its services.
+grep -q "S95majestic restart" "$SB/tmp/flash.log" \
+    && ok "...and hands the camera back with its services running" \
+    || bad "the refusal left the camera degraded, log='$(cat "$SB/tmp/flash.log")'"
+
+# The kernel is checked on the same terms.
+reset_env
+set_mtd <<'EOF'
+dev:    size   erasesize  name
+mtd0: 00040000 00010000 "boot"
+mtd1: 00010000 00010000 "env"
+mtd2: 00000010 00010000 "kernel"
+mtd3: 00500000 00010000 "rootfs"
+mtd4: 00100000 00010000 "rootfs_data"
+EOF
+run -z --kernel="$K" --rootfs="$R"
+if [ "$RC" -ne 0 ] && nothing_wrote; then
+    ok "a kernel too big for its partition is refused with nothing written"
+else
+    bad "oversized kernel -> expected a clean refusal, rc=$RC log='$(cat "$SB/tmp/flash.log")'"
+fi
+
+# A combined image has to be measured before the pivot too, and both of its
+# shapes are measurable there: whole-blob against the firmware partition...
+reset_env
+set_mtd <<'EOF'
+dev:    size   erasesize  name
+mtd0: 00040000 00010000 "boot"
+mtd1: 00010000 00010000 "env"
+mtd2: 00001000 00010000 "firmware"
+EOF
+make_combined "$SB/tmp/firmware.bin.ssc338q"
+make_archive "$SB/tmp/firmware.bin.ssc338q"
+run -z --archive="$SB/tmp/fw.tgz"
+if [ "$RC" -ne 0 ] && nothing_wrote && ! rebooted \
+    && printf '%s' "$OUT" | grep -q "does not fit its partition"; then
+    ok "an oversized whole-blob combined image is refused before the pivot"
+else
+    bad "oversized combined blob -> expected a clean refusal, rc=$RC log='$(cat "$SB/tmp/flash.log")'"
+fi
+
+# ...and on a split layout, each slice against its own partition, measured at
+# the same 64K-aligned FIT boundary do_update_firmware cuts on. The rootfs slice
+# is the one that used to be found only after the kernel had been committed.
+reset_env
+set_mtd <<'EOF'
+dev:    size   erasesize  name
+mtd0: 00040000 00010000 "boot"
+mtd1: 00010000 00010000 "env"
+mtd2: 00200000 00010000 "kernel"
+mtd3: 00001000 00010000 "rootfs"
+mtd4: 00100000 00010000 "rootfs_data"
+EOF
+make_combined "$SB/tmp/firmware.bin.ssc338q"
+make_archive "$SB/tmp/firmware.bin.ssc338q"
+run -z --archive="$SB/tmp/fw.tgz"
+if [ "$RC" -ne 0 ] && nothing_wrote && ! rebooted; then
+    ok "an oversized rootfs slice of a combined image is refused before the kernel is written"
+else
+    bad "oversized combined rootfs slice -> expected a clean refusal, rc=$RC log='$(cat "$SB/tmp/flash.log")'"
+fi
+
+# It must fail OPEN. The check is an early warning in front of flashcp's own
+# refusal, not a new gate: a size it cannot read must never block a flash that
+# would have worked. An image on a camera whose busybox has no stat applet is
+# the case that matters.
+reset_env
+stub stat 'exit 1'
+set_mtd <<'EOF'
+dev:    size   erasesize  name
+mtd0: 00040000 00010000 "boot"
+mtd1: 00010000 00010000 "env"
+mtd2: 00200000 00010000 "kernel"
+mtd3: 00001000 00010000 "rootfs"
+mtd4: 00100000 00010000 "rootfs_data"
+EOF
+run -z --kernel="$K" --rootfs="$R"
+if [ "$RC" -eq 0 ] && flashed /dev/mtd3; then
+    ok "a size it cannot read does not block the flash"
+else
+    bad "the size check must fail open, rc=$RC log='$(cat "$SB/tmp/flash.log")'"
+fi
+rm -f "$SB/bin/stat"
+
 # ---------------------------------------------------------------------------
 echo
 echo "=== Part 2: invariants in $SRC ==="
 
 # An option named in a user-facing message must exist in the parser.
-# --connect-timeout and --speed-limit/--speed-time are curl's, not ours.
+# --connect-timeout, --speed-limit/--speed-time and --max-filesize are curl's,
+# not ours.
 for opt in $(grep -oE '\-\-[a-z_]+' "$SRC" | sort -u); do
     case "$opt" in
-        --force_*|--wipe_overlay|--no_reboot|--no_update|--no_ramfs|--help|--web|--url|--archive|--kernel|--rootfs|--channel|--build|--list*|--insecure|--connect*|--speed*|--proto*) continue ;;
+        --force_*|--wipe_overlay|--no_reboot|--no_update|--no_ramfs|--help|--web|--url|--archive|--kernel|--rootfs|--channel|--build|--list*|--insecure|--connect*|--speed*|--proto*|--max*) continue ;;
     esac
     bad "message references '$opt', which the option parser does not accept"
 done
@@ -985,6 +1865,21 @@ awk '/^die\(\)/,/^}/' "$SRC" | grep -q 'restore_resources' \
 awk '/^restore_resources\(\)/,/^}/' "$SRC" | grep -q 'S95majestic restart' \
     && ok "restore_resources restarts majestic rather than starting it" \
     || bad "SIGQUIT leaves majestic running without an SDK; 'start' is a no-op, it needs 'restart'"
+# The breadcrumb pair (#2415, #2417). Its whole value rests on ORDER: the line
+# has to leave before syslogd stops, or a camera that never comes back takes the
+# explanation with it. A later reshuffle of free_resources() that moved the
+# logger below the stop would still pass every other check here.
+awk '/^free_resources\(\)/,/^}/' "$SRC" \
+    | grep -E 'logger|S01syslogd stop' | head -1 | grep -q 'logger' \
+    && ok "free_resources announces the flash before it stops syslogd" \
+    || bad "the pre-flash breadcrumb must precede 'S01syslogd stop', or it is never sent"
+awk '/^restore_resources\(\)/,/^}/' "$SRC" | grep -q 'logger' \
+    && ok "restore_resources retracts the breadcrumb when the camera stays up" \
+    || bad "an aborted run leaves the collector holding a death notice for a live camera"
+awk '/^free_resources\(\)/,/^}/' "$SRC" | grep -q 'syslog_remote_set' \
+    && ok "the pre-flash sleep is gated on forwarding actually being enabled" \
+    || bad "every camera pays the datagram-drain second for a feature most have off"
+
 grep -q 'mark_flash_touched' "$SRC" \
     && ok "the flash-touched marker exists" \
     || bad "mark_flash_touched is gone; die() cannot tell a pre-write failure apart"
@@ -1136,6 +2031,58 @@ awk '/^enter_ramfs\(\)/,/^}/' "$SRC" | grep -q 'grep -q "\^tmpfs \$RAM_ROOT tmpf
 awk '/^die\(\)/,/^}/' "$SRC" | grep -q '_ramfs_phase' \
     && ok "die() reboots unconditionally once we are in the ramfs" \
     || bad "a die() inside the ramfs must reboot; there is no system left to return to"
+# The success path needs the same rule. Handing a pivoted camera back to the
+# operator because -x was asked for leaves the corpse of #2416: pings, answers
+# nothing, and rejects a key that worked a minute earlier.
+awk '/^reboot_system\(\)/,/^}/' "$SRC" | grep -q '_ramfs_phase' \
+    && ok "reboot_system will not honour -x from inside the ramfs either (#2416)" \
+    || bad "an -x honoured inside the pivot strands a camera nobody can log into"
+# ...and the way that stops being the common case is not pivoting at all when
+# the run does not rewrite the flash the camera is served from. Gate and warning
+# have to be the same question, asked once, or they drift apart.
+if grep -q '^if ! rewrites_live_flash; then' "$SRC" &&
+    grep -q '\[ "1" = "\$skip_reboot" \] && rewrites_live_flash; then' "$SRC"; then
+    ok "the pivot and the -x warning are gated on one shared question"
+else
+    bad "enter_ramfs and the -x notice must share rewrites_live_flash, or they drift"
+fi
+# The size check has to run while the camera is still whole. Inside the pivot a
+# refusal can only reboot, and a reboot with nothing written is what a watcher
+# reads as a successful upgrade (majestic-webui #120).
+pf=$(grep -n '^preflight_image_sizes$' "$SRC" | head -1 | cut -d: -f1)
+er=$(grep -n 'enter_ramfs; then' "$SRC" | tail -1 | cut -d: -f1)
+if [ -n "$pf" ] && [ -n "$er" ] && [ "$pf" -lt "$er" ]; then
+    ok "images are measured before the pivot, not after it"
+else
+    bad "preflight_image_sizes must run before enter_ramfs -- preflight@${pf:-none} pivot@${er:-none}"
+fi
+# Every flashcp the script runs has to have its status read. A bare call
+# discards it and a pipeline hides it; either way a write that never happened is
+# announced as one that did (#2426).
+if grep -n 'set_progress flash' "$SRC" | grep -qv '||'; then
+    bad "an unguarded set_progress write: $(grep -n 'set_progress flash' "$SRC" | grep -v '||')"
+else
+    ok "every flashcp/flash_eraseall write is followed by a status check"
+fi
+# ...which only means anything if set_progress carries the status out of its own
+# pipe. `busybox "$@" | awk ...` returns awk's 0 however the write went, so in
+# silent mode -- the mode the WebUI drives -- every one of those guards was
+# dead code.
+if awk '/^set_progress\(\)/,/^}/' "$SRC" | grep -qF 'return ${st:-1}'; then
+    ok "set_progress returns the write's status, not awk's"
+else
+    bad "set_progress swallows the write's status in silent mode; every '|| die' behind it is dead code"
+fi
+# do_update_firmware and the pre-check must cut a combined image at the same
+# place, or the pre-check measures a rootfs slice that is not the one written.
+[ "$(grep -c 'fit_split_blocks' "$SRC")" -ge 3 ] \
+    && ok "the combined-image split boundary has one definition" \
+    || bad "the 64K FIT boundary is computed in more than one place; they will disagree"
+# check_image_fits runs inside the pivot as the backstop for the combined-image
+# split, and the staged root has only the applets enter_ramfs links by name.
+awk '/^enter_ramfs\(\)/,/^}/' "$SRC" | grep -q 'stat sync tail' \
+    && ok "the staged root carries stat, which the size check needs" \
+    || bad "check_image_fits reads sizes with stat; without the applet it silently fails open in the ramfs"
 # The WebUI keeps majestic alive on purpose: it is the server streaming the log,
 # and SIGQUIT to a majestic already in upgrade mode is a use-after-free
 # (tracked daemon-side). The only legitimate one left is free_resources'
@@ -1258,10 +2205,34 @@ for fn in do_update_rootfs do_update_firmware do_wipe_overlay; do
         bad "$fn writes flash the camera runs from and must mark it dirty"
     fi
 done
-if sed -n '/^do_update_kernel()/,/^}/p' "$SRC" | grep -q 'mark_live_flash_dirty'; then
-    bad "do_update_kernel must NOT mark dirty -- the kernel partition is not mounted"
+# do_update_kernel is the one that depends on the layout. A dedicated kernel
+# partition is not mounted, so marking it would cost -x its only real use; but
+# where there is none, kernel_device is the combined "firmware" partition, which
+# overlaps the running rootfs -- so the mark has to be conditional, never absent
+# and never unconditional.
+# check_platform runs after the ramfs pivot, where there is no /etc/os-release:
+# a read of the running build there comes back empty, and an empty platform is
+# "not a device profile", so the check passed silently -- which is what the
+# first on-camera run of it did (#2484). The running platform has to be taken
+# before the pivot and carried across it.
+cp=$(sed -n '/^check_platform()/,/^}/p' "$SRC")
+if printf '%s\n' "$cp" | grep -qE 'get_system_platform *\)|get_system_platform *""|/etc/os-release'; then
+    bad "check_platform reads the running os-release itself; it runs in the ramfs"
+elif ! grep -qE '^[[:space:]]*export .*\bsystem_platform\b' "$SRC"; then
+    bad "system_platform is not exported across the ramfs pivot"
 else
-    ok "do_update_kernel leaves -x alone (its partition is not mounted)"
+    ok "check_platform uses the pre-pivot platform, and it crosses the pivot"
+fi
+
+kbody=$(sed -n '/^do_update_kernel()/,/^}/p' "$SRC")
+if printf '%s\n' "$kbody" | grep -q 'mark_live_flash_dirty' &&
+    printf '%s\n' "$kbody" | grep -q 'mark_flash_touched' &&
+    printf '%s\n' "$kbody" | grep -q 'get_device "kernel"'; then
+    ok "do_update_kernel marks live only when its target is the combined partition"
+elif printf '%s\n' "$kbody" | grep -q 'mark_live_flash_dirty'; then
+    bad "do_update_kernel marks dirty unconditionally -- a dedicated kernel partition is not mounted, and -x loses its only real use"
+else
+    bad "do_update_kernel never marks live -- on a layout with no kernel partition it writes the running rootfs and -x would be honoured after it"
 fi
 
 # The mark belongs before the write (a half-erased partition is just as dead)
@@ -1300,6 +2271,144 @@ if sed -n '/-x, --no_reboot/,/-z, --no_update/p' "$SRC" | grep -qi 'ignored'; th
 else
     bad "-x usage text must document that it is ignored on a live-flash rewrite"
 fi
+
+# --- the boot-side half of the breadcrumb -----------------------------------
+# free_resources tells a collector "logging stops here until this camera
+# returns". Something has to say it returned, or the sentence has no end and a
+# reader cannot tell a camera that came back from one that did not. These are
+# tree-level assertions on that counterpart, not on $SRC.
+BOOTMSG=${BOOTMSG:-general/overlay/etc/init.d/S41bootmsg}
+if [ -x "$BOOTMSG" ]; then
+    ok "the boot-side counterpart exists and is executable"
+else
+    bad "$BOOTMSG must exist and be executable, or rcS will not run it"
+fi
+
+# Same priority as the two lines it pairs with, or a collector filtering at
+# >= warning gets the half that says the log stopped and not the half that
+# says it came back.
+if grep -q 'user\.warning' "$BOOTMSG" && grep -q 'user\.warning' "$SRC"; then
+    ok "both halves of the breadcrumb log at user.warning"
+else
+    bad "the boot marker and sysupgrade's must share a priority, or one is filtered out"
+fi
+
+# Gated, so a camera that forwards nothing pays nothing.
+if grep -q 'SYSLOG_REMOTE' "$BOOTMSG"; then
+    ok "the boot marker is gated on SYSLOG_REMOTE"
+else
+    bad "the boot marker must be gated on SYSLOG_REMOTE; every camera would pay for it"
+fi
+
+# Backgrounded. It waits up to fifteen seconds for a DHCP lease, and doing that
+# in line would hold up every later init script -- majestic, and the video with
+# it -- on exactly the cameras that asked for forwarding.
+if grep -qE '^\) &' "$BOOTMSG"; then
+    ok "the boot marker waits for its address off the boot path"
+else
+    bad "the boot marker must background its wait, or it delays the boot it reports on"
+fi
+
+# A hostname destination is resolved once, at S01, before the network exists,
+# and busybox retries only every 120 s (etc/default/syslogd says so). Anything
+# sent inside that window is dropped however ready the path is, so the marker
+# has to wait it out on a name -- confirmed on an hi3516av300, where the marker
+# was present locally and absent at a hostname collector. Restarting syslogd to
+# force a re-resolve is NOT the fix: its buffer is in RAM and logread loses the
+# whole boot with it.
+if grep -q 'sleep 125' "$BOOTMSG" && grep -q '\*\[!0-9\.\]\*' "$BOOTMSG"; then
+    ok "the boot marker waits out the DNS window when the collector is a name"
+else
+    bad "a hostname collector drops everything for 120s; the marker must wait that out"
+fi
+if grep -q 'S01syslogd restart\|syslogd restart' "$BOOTMSG"; then
+    bad "the boot marker must not restart syslogd; its RAM buffer is the boot's local log"
+else
+    ok "...without restarting syslogd and losing the in-RAM boot log"
+fi
+
+# --- the watchdog keeper ---------------------------------------------------
+#
+# majestic is the only thing on the image that pets the hardware watchdog (true
+# on gk7205v200, hi3516av300 and t31 alike), and the flash window is exactly
+# where it dies: it is demand-paged from the partition being erased and
+# free_resources has already dropped the cache, so its next fault is SIGBUS. The
+# driver leaves the dog armed on that close -- measured on gk7205v200, the SoC
+# hard-resets 297-307 s later, which lands inside the write on a slow enough
+# flash and leaves the rootfs part-written.
+#
+# Two properties hold the fix together, and neither shows up in the flash log.
+kf=$(awk '/^flash_and_reboot\(\)/,/^}/' "$SRC")
+printf '%s\n' "$kf" | grep -q 'watchdog_keep &' \
+    && ok "the flash phase arms the watchdog keeper" \
+    || bad "flash_and_reboot must start watchdog_keep"
+
+# Outside the pivot the keeper's own `sleep` would be one more exec off the
+# partition being erased, so it must not arm there.
+printf '%s\n' "$kf" | grep -q '_ramfs_phase' \
+    && ok "...only inside the pivot, where its sleep lives in RAM" \
+    || bad "the keeper must be gated on _ramfs_phase"
+
+# And it must never claim a device nobody was petting. On gk7205v200 the kernel
+# has no CONFIG_WATCHDOG at all and open_wdt.ko feeds the dog while userspace
+# holds no fd, so opening it on a camera whose owner turned the watchdog off
+# would CREATE the unfed fuse this exists to prevent.
+printf '%s\n' "$kf" | grep -q 'wdog_userspace_owned' \
+    && ok "...and only when a userspace owner was seen before the pivot" \
+    || bad "the keeper must be gated on wdog_userspace_owned"
+
+grep -qE '^	export .*\bwdog_userspace_owned\b' "$SRC" \
+    && ok "the owner verdict survives the re-exec (phase 2 cannot rescan)" \
+    || bad "wdog_userspace_owned must be exported into the ramfs phase"
+
+awk '/^watchdog_owner\(\)/,/^}/' "$SRC" | grep -q '\[ -c "\$WDOG" \]' \
+    && ok "watchdog_owner asks whether there is a watchdog at all first" \
+    || bad "watchdog_owner must check for the device before scanning"
+
+# `-ef` is a test builtin in both busybox ash and dash, so the scan costs no
+# forks; readlink cost one per open fd.
+awk '/^watchdog_owner\(\)/,/^}/' "$SRC" | grep -q -- '-ef' \
+    && ok "...and finds the holder without forking per descriptor" \
+    || bad "watchdog_owner should compare with -ef rather than fork readlink"
+
+# And it must not probe by opening: `exec` is a special builtin, so an open the
+# kernel refuses -- which is exactly what it gets while the owner is alive --
+# takes the keeper down without a word. Measured on hardware: probing that way
+# killed the keeper before the owner it was waiting for had died.
+kk=$(awk '/^watchdog_keep\(\)/,/^}/' "$SRC")
+kow=$(printf '%s\n' "$kk" | grep -n 'watchdog_owner' | head -1 | cut -d: -f1)
+kex=$(printf '%s\n' "$kk" | grep -n 'exec 9>' | head -1 | cut -d: -f1)
+if [ -n "$kow" ] && [ -n "$kex" ] && [ "$kow" -lt "$kex" ]; then
+    ok "the keeper asks who holds the device before it opens it"
+else
+    bad "watchdog_keep must test ownership before `exec 9>` (owner=$kow exec=$kex)"
+fi
+
+if awk '/^watchdog_keep\(\)/,/^}/' "$SRC" | grep -qF 'printf V'; then
+    bad "the keeper must NOT magic-close: a reboot that cannot exec needs the dog armed"
+else
+    ok "the keeper never disarms the dog, so a wedged reboot is still rescued"
+fi
+
+rbw=$(awk '/^reboot_system\(\)/,/^}/' "$SRC")
+relw=$(printf '%s\n' "$rbw" | grep -n 'WDOG_RELEASE' | head -1 | cut -d: -f1)
+rbtw=$(printf '%s\n' "$rbw" | grep -n 'busybox reboot' | head -1 | cut -d: -f1)
+if [ -n "$relw" ] && [ -n "$rbtw" ] && [ "$relw" -lt "$rbtw" ]; then
+    ok "petting stops before the reboot, not after it"
+else
+    bad "reboot_system must release the watchdog before it reboots (rel=$relw reboot=$rbtw)"
+fi
+
+grep -q '^WDOG=${WDOG:-/dev/watchdog}' "$SRC" && grep -q '^WDOG_PROC=${WDOG_PROC:-/proc}' "$SRC" \
+    && ok "both watchdog paths are overridable, so this suite never scans the real /proc" \
+    || bad "WDOG and WDOG_PROC must be overridable"
+
+# The short-rootfs refusal belongs on the pre-pivot path: inside the pivot a
+# die() has to reboot, and a reboot with nothing written is the outcome die()
+# goes out of its way to avoid.
+awk '/^preflight_image_sizes\(\)/,/^}/' "$SRC" | grep -q 'check_rootfs_complete' \
+    && ok "the incomplete-image check runs before the pivot" \
+    || bad "preflight_image_sizes must call check_rootfs_complete"
 
 echo
 if [ "$fail" -eq 0 ]; then

@@ -20,6 +20,28 @@ fi
 if grep -q "USES_MUSL=y" ${BR2_CONFIG}; then
 	ln -sf libc.so ${TARGET_DIR}/lib/ld-uClibc.so.0
 	ln -sf ../../lib/libc.so ${TARGET_DIR}/usr/bin/ldd
+
+	# The external toolchain copies libgcc_s and libatomic into every image
+	# whether anything links them or not: 36KB of squashfs on hi3516ev300,
+	# which is what tipped its lite board over the cap on 2026-09-25. musl
+	# never loads libgcc_s itself -- uClibc and glibc do, for pthread_cancel,
+	# so this stays inside the musl branch. The test is the name appearing
+	# anywhere in the target, which covers a NEEDED entry and a dlopen() by
+	# literal name alike, and keeps them for any board that ships C++.
+	for lib in libgcc_s libatomic; do
+		if ! grep -rqaF -D skip --exclude="${lib}.so*" "${lib}.so" ${TARGET_DIR}; then
+			rm -f ${TARGET_DIR}/lib/${lib}.so* ${TARGET_DIR}/usr/lib/${lib}.so*
+		fi
+	done
+fi
+
+# depmod writes a binary index beside every text one, plus
+# modules.builtin.modinfo, for kmod. Every board here runs busybox modprobe,
+# which reads modules.dep, modules.alias, modules.symbols and modules.builtin as
+# text and never opens the rest: 52KB on hi3516cv6xx, 12KB of squashfs, enough
+# to bring its lite board back under the cap. Kept wherever kmod is installed.
+if [ -z "$(find ${TARGET_DIR}/bin ${TARGET_DIR}/sbin ${TARGET_DIR}/usr/bin ${TARGET_DIR}/usr/sbin -name kmod -type f 2>/dev/null)" ]; then
+	rm -f ${TARGET_DIR}/lib/modules/*/modules.*.bin ${TARGET_DIR}/lib/modules/*/modules.builtin.modinfo
 fi
 
 LIST="${BR2_EXTERNAL_GENERAL_PATH}/scripts/excludes/${OPENIPC_SOC_MODEL}_${OPENIPC_VARIANT}.list"
